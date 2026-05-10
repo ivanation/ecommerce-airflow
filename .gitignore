@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Docker
+.docker/
+
+# Databases & Logs
+logs/
+postgres-data/
+*.log
+# Data
+data/raw/
+
+.DS_Store
+Thumbs.db
