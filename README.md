@@ -46,15 +46,33 @@ Se desarrolló un script de ingesta inteligente (`scripts/ingest.py`) que sigue 
 
 ---
 
+### 💎 4. Capa de Transformación (dbt - Data Build Tool)
+Se implementó **dbt** para transformar los datos crudos en información de negocio siguiendo la **Arquitectura Medallion**:
+
+*   **Staging (Silver - Individual):** Modelos 1:1 con las fuentes `raw` donde se renombran columnas, se estandarizan tipos de datos y se realiza limpieza básica (como la deduplicación de reseñas).
+*   **Intermediate (Silver - Transformation):** Capa donde se realizan uniones críticas (Joins) y agregaciones (ej. totales por pedido, traducción de categorías al inglés).
+*   **Marts (Gold - Business):** Tablas finales optimizadas para el análisis.
+    *   `fct_orders`: Tabla de hechos con métricas financieras y estados de envío.
+    *   `dim_customers` y `dim_products`: Dimensiones maestras.
+
+#### 🛡️ Calidad y Gobernanza de Datos
+*   **Tests de Esquema:** Se validan claves únicas y campos no nulos (`unique`, `not_null`).
+*   **Integridad Referencial:** Tests de `relationships` para asegurar que no existen pedidos sin clientes válidos.
+*   **Source Freshness:** Alertas automáticas si los datos de origen tienen más de 24 horas de antigüedad.
+*   **Linaje Automatizado:** Generación de diagramas de dependencia para auditoría técnica.
+
+---
+
 ### 🛠️ Pasos Realizados
 
 1.  **Definición de Servicios:** Creación del `docker-compose.yml` con políticas de salud (*healthchecks*) para asegurar que Airflow no inicie hasta que la BD esté lista.
 2.  **Configuración de Airflow:** Inicialización de la base de datos de metadatos y creación del usuario administrador de forma automática.
 3.  **Desarrollo del Pipeline de Ingesta:** Programación del script `ingest.py` con validaciones de tipos de datos y limpieza de nombres de columnas (snake_case).
+4.  **Implementación de dbt:** Configuración del proyecto `ecommerce_pipeline`, creación de modelos en 3 capas y validación mediante tests automatizados.
 
 ---
 
 ## 📈 Próximos Pasos
-*   [ ] Crear el primer **DAG en Airflow** para automatizar la ejecución del script de ingesta.
-*   [ ] Implementar una capa **Transform (dbt)** para limpiar los datos del esquema `raw` y moverlos a un esquema `analytics`.
-*   [ ] Construir un dashboard básico sobre el Data Warehouse.
+*   [ ] Crear el primer **DAG en Airflow** para automatizar la ejecución de la ingesta y dbt de forma secuencial.
+*   [ ] Construir un dashboard básico sobre el Data Warehouse (Marts).
+*   [ ] Optimizar la materialización (Tablas Incrementales) para grandes volúmenes de datos.

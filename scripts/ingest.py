@@ -1,141 +1,270 @@
 import os
-import hashlib
 import pandas as pd
-from datetime import datetime
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 from pathlib import Path
+from datetime import datetime
+import hashlib
+import json
+import warnings
 
-# Configuración de base de datos local (según docker-compose)
+# Configuración de base de datos local
 DB_USER = 'airflow'
 DB_PASSWORD = 'airflow'
 DB_HOST = 'localhost'
 DB_PORT = '5432'
 DB_NAME = 'airflow'
 
-# String de conexión SQLAlchemy
 engine = create_engine(f'postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}')
 
-# Directorio de los CSVs (relativo a la ubicación de este script)
 BASE_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = BASE_DIR / 'data' / 'raw'
 
-def create_schema_if_not_exists():
-    """Crea el schema 'raw' en la base de datos si no existe."""
+# ============================================================
+# NUEVAS FUNCIONES PARA MANEJO DE ESQUEMAS
+# ============================================================
+
+def create_schemas():
+    """Crea esquemas necesarios: raw, audit, quarantine"""
     with engine.connect() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS raw;"))
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS audit;"))
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS quarantine;"))
         conn.commit()
-    print("✅ Schema 'raw' verificado/creado exitosamente.")
+    print("✅ Esquemas verificados/creados")
+
+def create_audit_tables():
+    """Crea tablas de control de cambios de esquema"""
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS audit.schema_registry (
+                id SERIAL PRIMARY KEY,
+                table_name VARCHAR(100),
+                schema_hash VARCHAR(8),
+                columns JSONB,
+                detected_at TIMESTAMP DEFAULT NOW(),
+                source_file VARCHAR(255),
+                is_active BOOLEAN DEFAULT TRUE
+            );
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS audit.ingestion_log (
+                id SERIAL PRIMARY KEY,
+                table_name VARCHAR(100),
+                batch_id VARCHAR(8),
+                rows_ingested INT,
+                rows_rejected INT,
+                status VARCHAR(20),
+                message TEXT,
+                ingested_at TIMESTAMP DEFAULT NOW()
+            );
+        """))
+        conn.commit()
+    print("✅ Tablas de auditoría listas")
+
+def get_table_columns(schema, table_name):
+    """Obtiene columnas existentes en una tabla (si existe)"""
+    inspector = inspect(engine)
+    if inspector.has_table(table_name, schema=schema):
+        return [col['name'] for col in inspector.get_columns(table_name, schema=schema)]
+    return None
+
+def get_schema_hash(df):
+    """Calcula hash único del esquema del DataFrame"""
+    schema_info = {
+        'columns': list(df.columns),
+        'dtypes': {col: str(df[col].dtype) for col in df.columns}
+    }
+    return hashlib.md5(json.dumps(schema_info, sort_keys=True).encode()).hexdigest()[:8]
+
+def register_schema(table_name, schema_hash, df, source_file):
+    """Registra el esquema en la tabla de auditoría"""
+    columns_info = {col: str(df[col].dtype) for col in df.columns}
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO audit.schema_registry (table_name, schema_hash, columns, source_file)
+            VALUES (:table_name, :schema_hash, :columns, :source_file)
+        """), {
+            'table_name': table_name,
+            'schema_hash': schema_hash,
+            'columns': json.dumps(columns_info),
+            'source_file': source_file
+        })
+        conn.commit()
+
+def evolve_schema_if_needed(df, schema, table_name):
+    """
+    Detecta columnas nuevas o faltantes y evoluciona la tabla automáticamente.
+    Retorna (df_adaptado, cambios_detectados)
+    """
+    existing_cols = get_table_columns(schema, table_name)
+    if not existing_cols:
+        # Tabla nueva, no hay evolución necesaria
+        return df, {'added': [], 'removed': [], 'type_changes': []}
+    
+    current_cols = set(df.columns)
+    existing_set = set(existing_cols)
+    
+    added = current_cols - existing_set
+    removed = existing_set - current_cols
+    
+    changes = {'added': list(added), 'removed': list(removed), 'type_changes': []}
+    
+    # 1. Añadir columnas nuevas a la tabla
+    with engine.connect() as conn:
+        for col in added:
+            # Inferir tipo SQL básico
+            sample_value = df[col].dropna().iloc[0] if not df[col].dropna().empty else 'text'
+            if pd.api.types.is_integer_dtype(df[col]):
+                sql_type = "INTEGER"
+            elif pd.api.types.is_float_dtype(df[col]):
+                sql_type = "FLOAT"
+            elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                sql_type = "TIMESTAMP"
+            else:
+                sql_type = "TEXT"
+            try:
+                conn.execute(text(f"ALTER TABLE {schema}.{table_name} ADD COLUMN IF NOT EXISTS {col} {sql_type}"))
+                print(f"   ➕ Columna añadida: {col} ({sql_type})")
+            except Exception as e:
+                print(f"   ⚠️ No se pudo añadir {col}: {e}")
+        conn.commit()
+    
+    # 2. Para columnas removidas: no eliminamos datos históricos, solo advertimos
+    if removed:
+        print(f"   ⚠️ Columnas ya no presentes en el nuevo archivo: {removed}")
+        print(f"      Se insertarán como NULL en esas columnas.")
+    
+    # 3. Adaptar DataFrame: añadir columnas faltantes con NULL
+    for col in removed:
+        df[col] = None  # para que la inserción no falle
+    
+    # 4. Reordenar columnas para que coincidan con la tabla existente (opcional pero limpio)
+    df = df[existing_cols + list(added)]  # mantiene orden
+    
+    return df, changes
+
+def save_to_quarantine(df, csv_file, table_name, reason):
+    """Guarda datos problemáticos en cuarentena para revisión manual"""
+    quarantine_path = BASE_DIR / 'quarantine' / f"{table_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(quarantine_path, index=False)
+    print(f"   🛑 Datos enviados a cuarentena: {quarantine_path}")
+    # También guardar metadatos del problema
+    with open(quarantine_path.with_suffix('.meta.txt'), 'w') as f:
+        f.write(f"Table: {table_name}\nReason: {reason}\nSource: {csv_file.name}\nDate: {datetime.now()}")
+    return str(quarantine_path)
 
 def validate_and_clean(df):
-    """
-    Función básica para limpiar y validar tipos de datos.
-    Aplica conversiones genéricas o limpieza de nulos.
-    """
-    # 1. Eliminar filas donde todos los valores sean nulos
+    """Tu función original mejorada (sin cambiar nombres de columnas a minúsculas si quieres preservar original)"""
+    # Eliminar filas vacías
     df = df.dropna(how='all')
     
-    # 2. Convertir nombres de columnas a minúsculas y sin espacios (buena práctica para BD)
+    # estandarizar nombres de columnas (minúsculas, sin espacios)
     df.columns = [col.strip().lower().replace(' ', '_') for col in df.columns]
     
-    # 3. Intentar inferir fechas en columnas de tipo objeto/string
+    # Inferir fechas solo en columnas que parezcan fechas por su nombre (optimización heurística)
+    date_keywords = ['date', 'time', '_at', 'timestamp']
     for col in df.columns:
         if df[col].dtype == 'object':
-            try:
-                # Convierte a datetime solo si el formato es consistente, ignora si falla
-                df[col] = pd.to_datetime(df[col], format='mixed')
-            except (ValueError, TypeError):
-                pass
-                
+            if any(keyword in col.lower() for keyword in date_keywords):
+                try:
+                    df[col] = pd.to_datetime(df[col], format='mixed')
+                except (ValueError, TypeError):
+                    pass
     return df
 
 def ingest_data():
-    # Validar que el directorio exista
-    if not RAW_DIR.exists() or not RAW_DIR.is_dir():
-        print(f"❌ El directorio de datos no existe: {RAW_DIR}")
+    # Validar directorio
+    if not RAW_DIR.exists():
+        print(f"❌ Directorio no existe: {RAW_DIR}")
         return
-
+    
     csv_files = list(RAW_DIR.glob('*.csv'))
     if not csv_files:
-        print(f"⚠️ No se encontraron archivos CSV en {RAW_DIR}")
+        print(f"⚠️ No hay CSVs en {RAW_DIR}")
         return
-
-    # Preparar el schema
-    create_schema_if_not_exists()
-
-    # Procesar cada CSV encontrado
+    
+    # Preparar esquemas y tablas de control
+    create_schemas()
+    create_audit_tables()
+    
     for csv_file in csv_files:
-        table_name = csv_file.stem.lower() # Nombre de tabla = nombre del archivo
-        print(f"\nProcesando archivo: {csv_file.name} -> Tabla: raw.{table_name}")
+        table_name = csv_file.stem.lower()
+        print(f"\n📄 Procesando: {csv_file.name} → raw.{table_name}")
         
         try:
-            file_size_mb = csv_file.stat().st_size / (1024 * 1024)
-            file_hash = hashlib.md5(csv_file.read_bytes()).hexdigest()
+            # 1. Leer CSV (Optimizado con PyArrow)
+            df = pd.read_csv(csv_file, engine='pyarrow')
+            original_rows = len(df)
             
-            # Leer el CSV
-            df = pd.read_csv(csv_file)
-            rows_total = len(df)
-            rows_duplicates = len(df) - len(df.drop_duplicates())
-            
-            # Validación y limpieza
+            # 2. Limpiar datos (sin modificar columnas aún)
             df = validate_and_clean(df)
             
-            # AÑADIR METADATA (CRÍTICO)
+            # 3. Calcular hash del esquema
+            schema_hash = get_schema_hash(df)
+            
+            # 4. Registrar esquema (si es nuevo)
+            register_schema(table_name, schema_hash, df, csv_file.name)
+            
+            # 5. Evolucionar esquema de la tabla si es necesario
+            df, changes = evolve_schema_if_needed(df, 'raw', table_name)
+            
+            # 6. Añadir columnas de control (¡SIEMPRE!)
             df['_ingested_at'] = datetime.now()
             df['_source_file'] = csv_file.name
-            df['_batch_id'] = file_hash[:8]
+            df['_batch_id'] = schema_hash  # o un hash único del archivo
             
-            # Guardar en RAW (CON duplicados)
+            # 7. Si hay cambios drásticos, opcionalmente guardar copia en cuarentena
+            if changes['removed']:
+                # Podrías decidir si esto es crítico o no
+                warnings.warn(f"Columnas removidas en {csv_file.name}: {changes['removed']}")
+                # Opcional: guardar una copia en cuarentena
+                save_to_quarantine(df, csv_file, table_name, f"columnas_removidas:{changes['removed']}")
+            
+            # 8. Cargar a PostgreSQL (APPEND con Paginación)
             df.to_sql(
                 name=table_name,
                 con=engine,
                 schema='raw',
                 if_exists='append',
                 index=False,
-                method='multi'  # Mejor rendimiento
+                method='multi',      # mejora rendimiento
+                chunksize=10000      # evita desbordamientos de memoria RAM
             )
-            print(f"✅ Se cargaron exitosamente {len(df)} filas en raw.{table_name}.")
             
-            # Almacenas el contexto completo de cada ingesta
-            audit_table = {
-                '_batch_id': file_hash[:8],
-                'source_file': csv_file.name,
-                'ingested_at': datetime.now(),
-                'rows_total': rows_total,
-                'rows_duplicates': rows_duplicates,
-                'file_size_mb': file_size_mb,
-                'status': 'completed'
-            }
-            pd.DataFrame([audit_table]).to_sql(
-                name='ingestion_audit',
-                con=engine,
-                schema='raw',
-                if_exists='append',
-                index=False
-            )
+            # 9. Log de éxito
+            log_ingestion(table_name, schema_hash, original_rows, len(df), 'SUCCESS', '')
+            print(f"   ✅ Cargadas {len(df)} filas (nuevas columnas: {changes['added']})")
             
         except Exception as e:
-            print(f"❌ Error al procesar {csv_file.name}: {e}")
-            audit_table = {
-                '_batch_id': file_hash[:8] if 'file_hash' in locals() else None,
-                'source_file': csv_file.name,
-                'ingested_at': datetime.now(),
-                'rows_total': rows_total if 'rows_total' in locals() else None,
-                'rows_duplicates': rows_duplicates if 'rows_duplicates' in locals() else None,
-                'file_size_mb': file_size_mb if 'file_size_mb' in locals() else None,
-                'status': f'failed: {str(e)[:100]}'
-            }
+            error_msg = str(e)
+            print(f"   ❌ Error: {error_msg}")
+            log_ingestion(table_name, None, 0, 0, 'FAILED', error_msg)
+            # Guardar el CSV problemático completo en cuarentena
             try:
-                pd.DataFrame([audit_table]).to_sql(
-                    name='ingestion_audit',
-                    con=engine,
-                    schema='raw',
-                    if_exists='append',
-                    index=False
-                )
-            except Exception as audit_e:
-                print(f"⚠️ No se pudo guardar auditoría de error: {audit_e}")
+                df_problem = pd.read_csv(csv_file)
+                save_to_quarantine(df_problem, csv_file, table_name, f"error:{error_msg[:100]}")
+            except:
+                pass
+
+def log_ingestion(table_name, batch_id, rows_in, rows_out, status, message):
+    """Registra cada intento de ingesta"""
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO audit.ingestion_log 
+            (table_name, batch_id, rows_ingested, rows_rejected, status, message)
+            VALUES (:table_name, :batch_id, :rows_ingested, :rows_rejected, :status, :message)
+        """), {
+            'table_name': table_name,
+            'batch_id': batch_id,
+            'rows_ingested': rows_in,
+            'rows_rejected': rows_in - rows_out,
+            'status': status,
+            'message': message
+        })
+        conn.commit()
 
 if __name__ == '__main__':
-    print("🚀 Iniciando proceso de ingesta de CSVs a PostgreSQL...")
+    print("🚀 Iniciando ingesta robusta con manejo de cambios de esquema...")
     ingest_data()
-    print("🏁 Proceso de ingesta finalizado.")
+    print("🏁 Proceso completado.")

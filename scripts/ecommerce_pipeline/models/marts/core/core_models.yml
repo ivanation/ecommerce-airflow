@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: fct_orders
+    description: "Tabla principal de hechos: contiene un resumen completo de cada pedido."
+    columns:
+      - name: order_id
+        description: "ID único del pedido."
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        description: "Referencia al ID del cliente que realizó la compra."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+
+  - name: dim_products
+    description: "Dimensión de productos con categorías traducidas."
+    columns:
+      - name: product_id
+        description: "ID único del producto."
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_customers
+    description: "Dimensión de clientes con su información geográfica."
+    columns:
+      - name: customer_id
+        description: "ID transaccional del cliente."
+        tests:
+          - unique
+          - not_null

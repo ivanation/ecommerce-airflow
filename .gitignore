@@ -18,5 +18,14 @@ postgres-data/
 # Data
 data/raw/
 
+# dbt
+target/
+dbt_packages/
+logs/
+
+# Otros
+notas.txt
+diagrama.png
+
 .DS_Store
 Thumbs.db

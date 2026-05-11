@@ -1,0 +1,88 @@
+version: 2
+
+models:
+  - name: stg_customers
+    description: "Limpieza 1:1 de los datos de clientes, incluyendo su ID único y ubicación."
+    columns:
+      - name: customer_id
+        description: "ID de relación con la tabla de pedidos."
+        tests:
+          - unique
+          - not_null
+      - name: customer_unique_id
+        description: "ID único y persistente del cliente a través de múltiples pedidos."
+
+  - name: stg_orders
+    description: "Datos maestros de pedidos con estados y fechas clave del proceso de compra."
+    columns:
+      - name: order_id
+        description: "Identificador único de cada pedido."
+        tests:
+          - unique
+          - not_null
+      - name: order_status
+        description: "Estado actual del pedido (delivered, shipped, etc.)."
+
+  - name: stg_order_items
+    description: "Detalle de los productos incluidos en cada pedido con sus respectivos precios y fletes."
+    columns:
+      - name: order_id
+        description: "ID del pedido relacionado."
+        tests:
+          - not_null
+      - name: order_item_id
+        description: "Número secuencial del ítem dentro de un pedido."
+        tests:
+          - not_null
+
+  - name: stg_order_payments
+    description: "Información sobre los métodos de pago y cuotas aplicadas a cada orden."
+    columns:
+      - name: order_id
+        description: "ID del pedido relacionado."
+        tests:
+          - not_null
+
+  - name: stg_products
+    description: "Listado de productos con sus características físicas y categorías en portugués."
+    columns:
+      - name: product_id
+        description: "Identificador único del producto."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_sellers
+    description: "Directorio de vendedores que operan en la plataforma."
+    columns:
+      - name: seller_id
+        description: "Identificador único del vendedor."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_order_reviews
+    description: "Reseñas de clientes deduplicadas, conservando siempre la más reciente."
+    columns:
+      - name: review_id
+        description: "ID de la reseña del cliente."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_geolocation
+    description: "Datos de geolocalización por prefijo de código postal."
+    columns:
+      - name: zip_code_prefix
+        description: "Prefijo numérico del código postal."
+        tests:
+          - not_null
+
+  - name: stg_category_name_translation
+    description: "Mapeo de traducción de categorías de producto de portugués a inglés."
+    columns:
+      - name: category_name
+        description: "Nombre de la categoría en portugués."
+        tests:
+          - unique
+          - not_null
