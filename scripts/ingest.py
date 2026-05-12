@@ -10,7 +10,7 @@ import warnings
 # Configuración de base de datos local
 DB_USER = 'airflow'
 DB_PASSWORD = 'airflow'
-DB_HOST = 'localhost'
+DB_HOST = os.getenv('DB_HOST', 'localhost')
 DB_PORT = '5432'
 DB_NAME = 'airflow'
 
@@ -25,16 +25,15 @@ RAW_DIR = BASE_DIR / 'data' / 'raw'
 
 def create_schemas():
     """Crea esquemas necesarios: raw, audit, quarantine"""
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS raw;"))
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS audit;"))
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS quarantine;"))
-        conn.commit()
     print("✅ Esquemas verificados/creados")
 
 def create_audit_tables():
     """Crea tablas de control de cambios de esquema"""
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS audit.schema_registry (
                 id SERIAL PRIMARY KEY,
@@ -51,6 +50,7 @@ def create_audit_tables():
                 id SERIAL PRIMARY KEY,
                 table_name VARCHAR(100),
                 batch_id VARCHAR(8),
+                source_file VARCHAR(255),
                 rows_ingested INT,
                 rows_rejected INT,
                 status VARCHAR(20),
@@ -58,8 +58,18 @@ def create_audit_tables():
                 ingested_at TIMESTAMP DEFAULT NOW()
             );
         """))
-        conn.commit()
-    print("✅ Tablas de auditoría listas")
+        # Aseguramos que la columna source_file existe (Evolución manual)
+        conn.execute(text("ALTER TABLE audit.ingestion_log ADD COLUMN IF NOT EXISTS source_file VARCHAR(255);"))
+    print("✅ Tablas de auditoría listas y actualizadas")
+
+def is_file_processed(filename):
+    """Verifica si un archivo ya fue procesado exitosamente"""
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            SELECT COUNT(*) FROM audit.ingestion_log 
+            WHERE source_file = :filename AND status = 'SUCCESS'
+        """), {'filename': filename}).scalar()
+    return result > 0
 
 def get_table_columns(schema, table_name):
     """Obtiene columnas existentes en una tabla (si existe)"""
@@ -79,7 +89,7 @@ def get_schema_hash(df):
 def register_schema(table_name, schema_hash, df, source_file):
     """Registra el esquema en la tabla de auditoría"""
     columns_info = {col: str(df[col].dtype) for col in df.columns}
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO audit.schema_registry (table_name, schema_hash, columns, source_file)
             VALUES (:table_name, :schema_hash, :columns, :source_file)
@@ -89,7 +99,6 @@ def register_schema(table_name, schema_hash, df, source_file):
             'columns': json.dumps(columns_info),
             'source_file': source_file
         })
-        conn.commit()
 
 def evolve_schema_if_needed(df, schema, table_name):
     """
@@ -104,13 +113,18 @@ def evolve_schema_if_needed(df, schema, table_name):
     current_cols = set(df.columns)
     existing_set = set(existing_cols)
     
+    # Ignorar columnas de auditoría en la comparación para no intentar añadirlas si ya existen
+    audit_cols = {'_ingested_at', '_source_file', '_batch_id'}
+    existing_set = existing_set - audit_cols
+    current_cols = current_cols - audit_cols
+    
     added = current_cols - existing_set
     removed = existing_set - current_cols
     
     changes = {'added': list(added), 'removed': list(removed), 'type_changes': []}
     
     # 1. Añadir columnas nuevas a la tabla
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         for col in added:
             # Inferir tipo SQL básico
             sample_value = df[col].dropna().iloc[0] if not df[col].dropna().empty else 'text'
@@ -127,7 +141,6 @@ def evolve_schema_if_needed(df, schema, table_name):
                 print(f"   ➕ Columna añadida: {col} ({sql_type})")
             except Exception as e:
                 print(f"   ⚠️ No se pudo añadir {col}: {e}")
-        conn.commit()
     
     # 2. Para columnas removidas: no eliminamos datos históricos, solo advertimos
     if removed:
@@ -189,7 +202,15 @@ def ingest_data():
     create_audit_tables()
     
     for csv_file in csv_files:
+        if is_file_processed(csv_file.name):
+            print(f"⏩ Saltando: {csv_file.name} (Ya procesado anteriormente)")
+            continue
+
         table_name = csv_file.stem.lower()
+        # Si el nombre tiene fecha (ej: orders_20231027), limpiamos para que la tabla sea solo 'orders'
+        if '_' in table_name and any(char.isdigit() for char in table_name):
+            table_name = table_name.split('_')[0]
+            
         print(f"\n📄 Procesando: {csv_file.name} → raw.{table_name}")
         
         try:
@@ -197,22 +218,22 @@ def ingest_data():
             df = pd.read_csv(csv_file, engine='pyarrow')
             original_rows = len(df)
             
-            # 2. Limpiar datos (sin modificar columnas aún)
+            # 2. Limpiar datos
             df = validate_and_clean(df)
             
-            # 3. Calcular hash del esquema
-            schema_hash = get_schema_hash(df)
-            
-            # 4. Registrar esquema (si es nuevo)
-            register_schema(table_name, schema_hash, df, csv_file.name)
-            
-            # 5. Evolucionar esquema de la tabla si es necesario
-            df, changes = evolve_schema_if_needed(df, 'raw', table_name)
-            
-            # 6. Añadir columnas de control (¡SIEMPRE!)
+            # 3. Añadir columnas de control (¡ANTES de evolucionar el esquema!)
             df['_ingested_at'] = datetime.now()
             df['_source_file'] = csv_file.name
-            df['_batch_id'] = schema_hash  # o un hash único del archivo
+            df['_batch_id'] = hashlib.md5(csv_file.name.encode()).hexdigest()[:8]
+            
+            # 4. Calcular hash del esquema (ahora con auditoría)
+            schema_hash = get_schema_hash(df)
+            
+            # 5. Registrar esquema (si es nuevo)
+            register_schema(table_name, schema_hash, df, csv_file.name)
+            
+            # 6. Evolucionar esquema de la tabla si es necesario
+            df, changes = evolve_schema_if_needed(df, 'raw', table_name)
             
             # 7. Si hay cambios drásticos, opcionalmente guardar copia en cuarentena
             if changes['removed']:
@@ -233,13 +254,13 @@ def ingest_data():
             )
             
             # 9. Log de éxito
-            log_ingestion(table_name, schema_hash, original_rows, len(df), 'SUCCESS', '')
+            log_ingestion(table_name, schema_hash, csv_file.name, original_rows, len(df), 'SUCCESS', '')
             print(f"   ✅ Cargadas {len(df)} filas (nuevas columnas: {changes['added']})")
             
         except Exception as e:
             error_msg = str(e)
             print(f"   ❌ Error: {error_msg}")
-            log_ingestion(table_name, None, 0, 0, 'FAILED', error_msg)
+            log_ingestion(table_name, None, csv_file.name, 0, 0, 'FAILED', error_msg)
             # Guardar el CSV problemático completo en cuarentena
             try:
                 df_problem = pd.read_csv(csv_file)
@@ -247,22 +268,22 @@ def ingest_data():
             except:
                 pass
 
-def log_ingestion(table_name, batch_id, rows_in, rows_out, status, message):
+def log_ingestion(table_name, batch_id, source_file, rows_in, rows_out, status, message):
     """Registra cada intento de ingesta"""
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO audit.ingestion_log 
-            (table_name, batch_id, rows_ingested, rows_rejected, status, message)
-            VALUES (:table_name, :batch_id, :rows_ingested, :rows_rejected, :status, :message)
+            (table_name, batch_id, source_file, rows_ingested, rows_rejected, status, message)
+            VALUES (:table_name, :batch_id, :source_file, :rows_ingested, :rows_rejected, :status, :message)
         """), {
             'table_name': table_name,
             'batch_id': batch_id,
+            'source_file': source_file,
             'rows_ingested': rows_in,
             'rows_rejected': rows_in - rows_out,
             'status': status,
             'message': message
         })
-        conn.commit()
 
 if __name__ == '__main__':
     print("🚀 Iniciando ingesta robusta con manejo de cambios de esquema...")

@@ -17,6 +17,7 @@ postgres-data/
 *.log
 # Data
 data/raw/
+quarantine/
 
 # dbt
 target/

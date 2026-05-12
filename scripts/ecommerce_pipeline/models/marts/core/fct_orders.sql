@@ -1,5 +1,15 @@
+{{
+  config(
+    materialized='incremental',
+    unique_key='order_id'
+  )
+}}
+
 WITH orders AS (
     SELECT * FROM {{ ref('stg_orders') }}
+    {% if is_incremental() %}
+    WHERE _ingested_at > (SELECT MAX(_ingested_at) FROM {{ this }})
+    {% endif %}
 ),
 
 customers AS (

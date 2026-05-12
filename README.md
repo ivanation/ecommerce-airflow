@@ -6,6 +6,15 @@ Este proyecto representa la construcción de una infraestructura moderna de dato
 
 El objetivo es crear un entorno robusto que permita la ingesta de datos brutos (RAW), su orquestación mediante flujos de trabajo y la gestión de un Data Warehouse local.
 
+## 🛠️ Pilares del Proyecto
+*   **Infraestructura:** Un entorno completo con Docker (Postgres + Airflow + pgAdmin).
+*   **Ingesta Robusta:** Script de Python que maneja errores, detecta cambios de esquema, evita duplicados y deja rastro de auditoría.
+*   **Arquitectura de Datos (Medallion):** Pipeline de dbt con capas de Staging, Intermediate y Marts.
+*   **Gobernanza:** Tests automáticos de calidad, integridad referencial y frescura de datos.
+*   **Orquestación:** Un flujo automatizado en Airflow que vigila cada paso por ti.
+
+---
+
 ### 🏗️ 1. Infraestructura con Docker (El Corazón del Sistema)
 Se decidió utilizar **Docker Compose** para desplegar una arquitectura de tres capas:
 *   **PostgreSQL (Data Warehouse):** Nuestra base de datos central. Se configuró para persistir los datos en volúmenes locales, asegurando que la información no se pierda al reiniciar los contenedores.
@@ -69,10 +78,10 @@ Se implementó **dbt** para transformar los datos crudos en información de nego
 2.  **Configuración de Airflow:** Inicialización de la base de datos de metadatos y creación del usuario administrador de forma automática.
 3.  **Desarrollo del Pipeline de Ingesta:** Programación del script `ingest.py` con validaciones de tipos de datos y limpieza de nombres de columnas (snake_case).
 4.  **Implementación de dbt:** Configuración del proyecto `ecommerce_pipeline`, creación de modelos en 3 capas y validación mediante tests automatizados.
+5.  **Orquestación con Airflow:** Creación de un DAG que automatiza la ingesta, la transformación y los tests de calidad de forma secuencial.
 
 ---
 
 ## 📈 Próximos Pasos
-*   [ ] Crear el primer **DAG en Airflow** para automatizar la ejecución de la ingesta y dbt de forma secuencial.
 *   [ ] Construir un dashboard básico sobre el Data Warehouse (Marts).
 *   [ ] Optimizar la materialización (Tablas Incrementales) para grandes volúmenes de datos.

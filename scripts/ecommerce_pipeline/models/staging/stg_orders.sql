@@ -1,5 +1,17 @@
+{{
+  config(
+    materialized='incremental',
+    unique_key='order_id'
+  )
+}}
+
 WITH source AS (
     SELECT * FROM {{ source('raw', 'olist_orders_dataset') }}
+    
+    {% if is_incremental() %}
+    -- Solo traemos datos cargados después de la última ejecución exitosa
+    WHERE _ingested_at > (SELECT MAX(_ingested_at) FROM {{ this }})
+    {% endif %}
 )
 
 SELECT
